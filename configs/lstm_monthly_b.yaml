@@ -1,0 +1,48 @@
+# Aylık görünüm, B düzeni: tek uzun bölme (train ≤ 2010, val 2011–2016, test 2017-01 → 2026-09).
+# Örnek az olduğu için modeller küçük ve güçlü düzenlileştirilmiş.
+name: lstm_monthly_b
+output_dir: outputs/runs
+
+data:
+  returns_csv: data/processed/49_sektor_gunluk_getiri_temiz.csv
+  start: "1985-01-01"
+  end: "2026-09-30"
+  frequency: monthly
+  view:
+    features: [mean, max, min]        # isteğe bağlı 4. özellik: std
+
+split:
+  train_end: "2010-12-31"
+  val_end: "2016-12-31"
+  embargo: 1                          # ay
+
+prep:
+  lookback: 12                        # ay
+  clip: 10.0
+
+baselines:
+  names: [persistence, ewma, har_own, har_market, ridge_all]
+
+models:
+  - name: lstm_cross
+    type: cross_lstm
+    params: {hidden: 16, layers: 1, dropout: 0.3}
+  - name: lstm_own
+    type: own_lstm
+    params: {hidden: 16, layers: 1, dropout: 0.3, embed_dim: 4}
+
+training:
+  epochs: 300
+  batch_size: 32
+  lr: 1.0e-3
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  patience: 20
+  device: auto
+  log_every: 25
+
+seeds: [0, 1, 2, 3, 4]
+
+evaluation:
+  reference: har_own
+  pairs: [[lstm_cross, lstm_own]]

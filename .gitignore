@@ -1,0 +1,16 @@
+# Python ortamı ve önbellekler
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# macOS
+.DS_Store
+
+# Ham veri: Kenneth French sitesinden yeniden indirilebilir
+data/raw/
+
+# Deney çıktıları (sonuçlar, grafikler, checkpoint'ler)
+outputs/

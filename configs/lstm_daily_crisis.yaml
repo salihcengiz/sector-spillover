@@ -1,0 +1,60 @@
+# Günlük görünüm, danışman düzeni: son ~1 yıl + kısa kriz pencereleri.
+# Her pencere ayrı bir katman (fold): ölçekleyici ve modeller yalnızca o pencereden önceki veriyle eğitilir.
+name: lstm_daily_crisis
+output_dir: outputs/runs
+
+data:
+  returns_csv: data/processed/49_sektor_gunluk_getiri_temiz.csv
+  start: "1985-01-01"
+  end: "2026-09-30"
+  frequency: daily
+  view:
+    features: [ret, log_r2, log_rv5, log_rv22]
+    horizon: 5
+
+split:
+  embargo: 22                         # işlem günü
+  folds:
+    - name: covid
+      train: [[null, "2018-12-31"]]
+      val:   [["2019-01-01", "2019-12-31"]]
+      test:  [["2020-02-20", "2020-06-30"]]
+    - name: svb
+      train: [[null, "2021-12-31"]]
+      val:   [["2022-01-01", "2022-12-31"]]
+      test:  [["2023-03-01", "2023-05-31"]]
+    - name: last_year
+      train: [[null, "2024-09-30"]]
+      val:   [["2024-10-01", "2025-09-30"]]
+      test:  [["2025-10-01", "2026-09-30"]]
+
+prep:
+  lookback: 60                        # işlem günü
+  clip: 10.0
+
+baselines:
+  names: [persistence, ewma, har_own, har_market, ridge_all]
+
+models:
+  - name: lstm_cross
+    type: cross_lstm
+    params: {hidden: 64, layers: 1, dropout: 0.2}
+  - name: lstm_own
+    type: own_lstm
+    params: {hidden: 64, layers: 1, dropout: 0.2, embed_dim: 8}
+
+training:
+  epochs: 100
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  patience: 10
+  device: auto
+  log_every: 10
+
+seeds: [0, 1, 2, 3, 4]
+
+evaluation:
+  reference: har_own
+  pairs: [[lstm_cross, lstm_own]]

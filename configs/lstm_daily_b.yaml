@@ -1,0 +1,48 @@
+# Günlük görünüm, B düzeni (karşılaştırma için): train ≤ 2010, val 2011–2016, test 2017 → 2026-09.
+name: lstm_daily_b
+output_dir: outputs/runs
+
+data:
+  returns_csv: data/processed/49_sektor_gunluk_getiri_temiz.csv
+  start: "1985-01-01"
+  end: "2026-09-30"
+  frequency: daily
+  view:
+    features: [ret, log_r2, log_rv5, log_rv22]
+    horizon: 5
+
+split:
+  train_end: "2010-12-31"
+  val_end: "2016-12-31"
+  embargo: 22                         # işlem günü
+
+prep:
+  lookback: 60                        # işlem günü
+  clip: 10.0
+
+baselines:
+  names: [persistence, ewma, har_own, har_market, ridge_all]
+
+models:
+  - name: lstm_cross
+    type: cross_lstm
+    params: {hidden: 64, layers: 1, dropout: 0.2}
+  - name: lstm_own
+    type: own_lstm
+    params: {hidden: 64, layers: 1, dropout: 0.2, embed_dim: 8}
+
+training:
+  epochs: 100
+  batch_size: 128
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  grad_clip: 1.0
+  patience: 10
+  device: auto
+  log_every: 10
+
+seeds: [0, 1, 2, 3, 4]
+
+evaluation:
+  reference: har_own
+  pairs: [[lstm_cross, lstm_own]]
