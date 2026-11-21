@@ -83,7 +83,7 @@ def train_model(model: nn.Module, data: PreparedData, cfg: TrainConfig,
             if cfg.grad_clip:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
             optimizer.step()
-            total += float(loss) * len(xb)
+            total += loss.item() * len(xb)
             count += len(xb)
         val_loss = dataset_loss(model, val_ds, cfg.eval_batch_size)
         history.append({"epoch": epoch, "train_loss": total / count, "val_loss": val_loss})
