@@ -1,8 +1,7 @@
 # Aşama 1 (klasik LSTM ile ileri risk tahmini) bağımlılıkları.
-# Colab'da kurulum (depo kökünde):
-#   pip install -r requirements.txt
-#   pip install -e .
-# Colab'da torch önceden kurulu gelir; sürüm uygunsa yeniden indirilmez.
+# Yerel / yeni bir ortam için: pip install -r requirements.txt && pip install -e .
+# Colab'da bu dosya KURULMAZ: torch, numpy, pandas vb. hazır gelir; yalnızca `pip install -e .`
+# yapılır (bkz. notebooks/00_colab_kurulum.ipynb).
 # requirements-lock.txt: ilk yerel kurulumdaki (macOS, Python 3.13) kesin sürümlerin kaydı.
 
 # Model

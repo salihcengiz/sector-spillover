@@ -57,7 +57,7 @@ def test_own_sector_model_has_no_cross_effects():
     with torch.no_grad():
         d_own = own(shocked) - own(x)
         d_cross = cross(shocked) - cross(x)
-    assert torch.equal(d_own[:, 1:], torch.zeros_like(d_own[:, 1:])), "köşegen dışı etki tam olarak 0 olmalı"
+    assert d_own[:, 1:].abs().max() < 1e-6, "köşegen dışı etki 0 olmalı (yalnızca kayan nokta gürültüsü)"
     assert d_own[:, 0].abs().max() > 0
     assert d_cross[:, 1:].abs().max() > 0, "çapraz model diğer sektörlerden etkilenebilmeli"
 

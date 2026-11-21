@@ -23,14 +23,30 @@ tests/             birim ve sızıntı testleri
 outputs/           deney çıktıları (git'e girmez)
 ```
 
-## Colab'da kurulum
+## Colab'da çalıştırma
+
+Hazır akış `notebooks/00_colab_kurulum.ipynb` notebook'unda. Colab'da *File → Open notebook → GitHub* menüsünden bu depoyu açıp notebook'u seçmen yeterli. Notebook şu adımları sırayla yapar: klon → kurulum → testler → hızlı deneme → tam koşular → sonuçları Drive'a kopyalama.
+
+Elle çalıştırmak istersen:
 
 ```bash
-git clone <depo-adresi>
-cd <depo-klasörü>
-pip install -r requirements.txt
-pip install -e .
+git clone https://github.com/salihcengiz/sector-spillover.git
+cd sector-spillover
+pip install -e .          # Colab'da torch/numpy/pandas vb. hazır; requirements.txt kurulmaz
+python -m pytest -q
+python scripts/run_experiment.py --config configs/lstm_monthly_b.yaml --quick
+python scripts/run_experiment.py --config configs/lstm_monthly_b.yaml
 ```
+
+## Deneyler
+
+| Config | Görünüm | Bölme |
+|---|---|---|
+| `configs/lstm_monthly_b.yaml` | aylık | B: train ≤ 2010, val 2011–2016, test 2017 → 2026-09; embargo 1 ay |
+| `configs/lstm_daily_crisis.yaml` | günlük | COVID, SVB ve son 1 yıl için ayrı katmanlar; her katmanda yalnızca öncesindeki veriyle eğitim; embargo 22 gün |
+| `configs/lstm_daily_b.yaml` | günlük | B (ön analizle karşılaştırma için) |
+
+Seçenekler: `--quick` (tek seed, 2 epoch), `--folds covid svb` (yalnızca seçilen katmanlar), `--baselines-only` (yalnızca kıyas modelleri; torch gerekmez). Çıktılar `outputs/runs/<zaman>_<ad>/` altına yazılır.
 
 ## Ham veriden temiz dosya üretmek
 
