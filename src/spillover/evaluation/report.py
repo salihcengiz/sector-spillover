@@ -23,10 +23,17 @@ ALL_SECTORS = "ALL"
 def evaluate(predictions: Dict[str, np.ndarray], panel: Panel, idx: np.ndarray, benchmark: np.ndarray,
              reference: Optional[str] = None, dm_lag: Optional[int] = None) -> Dict[str, pd.DataFrame]:
     """predictions: {ad: (T, N) tahmin}. idx: değerlendirilecek örnekler (örn. splits.test).
-    benchmark: (N,) OOS R² kıyası (train ortalaması). reference: DM ve göreli MSE için model adı.
+    benchmark: OOS R² kıyası. (N,) ise tek train ortalaması; (T, N) ise her dönem için o dönemde
+               bilinen ortalama (katmanları birleştirilmiş walk-forward tahminlerinde kullanılır).
+    reference: DM ve göreli MSE için model adı.
     """
     idx = np.asarray(idx)
     y = panel.y[idx]
+    benchmark = np.asarray(benchmark, dtype=float)
+    if benchmark.ndim == 2:
+        benchmark = benchmark[idx]
+    if not np.isfinite(benchmark).all():
+        raise ValueError("Kıyas (benchmark) değerlendirme örneklerinde tanımsız.")
     if not np.isfinite(y).all():
         raise ValueError("Değerlendirme örneklerinde hedef tanımsız.")
     sectors = list(panel.sectors)

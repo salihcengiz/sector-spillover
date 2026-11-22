@@ -4,7 +4,9 @@ Her bölüm bir veya birkaç tarih aralığından oluşur (`SplitSpec`). Hiçbir
 dönemler kullanılmaz. Bir örnek, tahminin yapıldığı t dönemidir:
 
 - Girdi penceresi [t-lookback+1, t]. Önceki dönemlere taşabilir, çünkü bu geçmiş bilgidir.
-- Purge: hedef penceresi [t+1, t+horizon] tamamen t'nin bölümünde kalmalıdır.
+- Purge: hedef penceresi [t+1, t+horizon] başka bir bölüme taşamaz. Hiçbir bölüme girmeyen
+  (kullanılmayan) dönemlere taşıyabilir; model o dönemleri hiç görmediği için bu sızıntı değildir
+  ve test pencerelerinin son günleri / ayları kaybolmaz.
 - Embargo (E dönem): bir train örneğinin [t-E, t+horizon+E] aralığında hiç val/test dönemi
   bulunmamalıdır. Böylece val/test pencerelerinin iki yanında boşluk kalır. Ölçekleyicinin fit
   edildiği satırlar (train_rows) da [t-E, t] aralığında val/test dönemi içermez.
@@ -12,7 +14,7 @@ dönemler kullanılmaz. Bir örnek, tahminin yapıldığı t dönemidir:
 Aynı yapı bütün düzenleri kapsar:
 - Tek uzun bölme (aylık B): SplitSpec.sequential("2010-12-31", "2016-12-31", embargo=1)
 - Kriz pencereleri (günlük): her pencere için ayrı bir SplitSpec
-- Walk-forward (aylık A): her test yılı için ayrı bir SplitSpec
+- Walk-forward (aylık A): walk_forward_specs(...) her test yılı için bir SplitSpec üretir
 """
 from __future__ import annotations
 
@@ -26,6 +28,7 @@ from ..data.panel import Panel
 
 SPLIT_NAMES = ("train", "val", "test")
 UNUSED = -1                                   # hiçbir bölüme girmeyen dönem
+_PAST_END = -2                                # verinin sonundan sonrası
 DEFAULT_EMBARGO = {"daily": 22, "monthly": 1}  # dönem cinsinden (22 işlem günü ≈ 1 ay)
 
 
@@ -98,6 +101,27 @@ class SplitSpec:
         return labels
 
 
+def walk_forward_specs(first_test_year: int, last_test_year: int, val_years: int,
+                       embargo: int = 0) -> list:
+    """Genişleyen pencereli walk-forward: her test yılı Y için bir SplitSpec (adı "y<Y>").
+
+        train : verinin başı → (Y - val_years - 1)-12-31
+        val   : (Y - val_years)-01-01 → (Y - 1)-12-31
+        test  : Y-01-01 → Y-12-31
+    İlk katman, aynı val_years ile kurulan sıralı bölmenin (B) ilk test yılıyla aynıdır.
+    """
+    if val_years < 1 or last_test_year < first_test_year:
+        raise ValueError("val_years ≥ 1 ve last_test_year ≥ first_test_year olmalı.")
+    specs = []
+    for year in range(int(first_test_year), int(last_test_year) + 1):
+        specs.append(SplitSpec(
+            train=[(None, f"{year - val_years - 1}-12-31")],
+            val=[(f"{year - val_years}-01-01", f"{year - 1}-12-31")],
+            test=[(f"{year}-01-01", f"{year}-12-31")],
+            embargo=embargo, name=f"y{year}"))
+    return specs
+
+
 @dataclass(frozen=True)
 class Splits:
     train: np.ndarray        # örnek indeksleri (tahmin dönemi t)
@@ -133,11 +157,12 @@ def make_splits(panel: Panel, spec, lookback: int) -> Splits:
     first = panel.first_valid_index()
     usable = (pos - lookback + 1 >= first) & np.isfinite(panel.y).all(axis=1)
 
-    # Purge: t+1 … t+h dönemleri t ile aynı bölümde olmalı (verinin sonu sayılmaz).
-    padded = np.concatenate([labels, np.full(h, UNUSED - 1)])
+    # Purge: t+1 … t+h dönemleri t'nin bölümünde ya da kullanılmayan dönemlerde olmalı.
+    padded = np.concatenate([labels, np.full(h, _PAST_END)])
     same_ahead = np.ones(T, dtype=bool)
     for k in range(1, h + 1):
-        same_ahead &= padded[k:k + T] == labels
+        ahead = padded[k:k + T]
+        same_ahead &= (ahead == labels) | (ahead == UNUSED)
 
     # Embargo: [t+lo, t+hi] aralığında val/test dönemi var mı?
     eval_count = np.concatenate([[0], np.cumsum((labels == 1) | (labels == 2))])

@@ -8,7 +8,8 @@ import numpy as np
 import pandas as pd
 
 from spillover.data import DailyView, MonthlyView, load_returns
-from spillover.prep import DEFAULT_EMBARGO, SplitSpec, Standardizer, WindowDataset, make_splits, prepare
+from spillover.prep import (DEFAULT_EMBARGO, UNUSED, SplitSpec, Standardizer, WindowDataset, make_splits,
+                            prepare, walk_forward_specs)
 
 ROOT = Path(__file__).resolve().parents[1]
 RETURNS_CSV = ROOT / "data" / "processed" / "49_sektor_gunluk_getiri_temiz.csv"
@@ -31,7 +32,8 @@ def check_split_invariants(panel, splits):
         assert idx.size > 0
         assert (labels[idx] == code).all(), f"{name}: örnek kendi döneminde olmalı"
         for k in range(1, h + 1):
-            assert (idx + k < panel.T).all() and (labels[idx + k] == code).all(), f"{name}: purge ihlali"
+            ahead = labels[idx + k] if (idx + k < panel.T).all() else None
+            assert ahead is not None and np.isin(ahead, (code, UNUSED)).all(), f"{name}: purge ihlali"
         assert (idx - splits.lookback + 1 >= first).all(), f"{name}: girdi penceresi tanımlı verinin içinde olmalı"
         assert np.isfinite(panel.y[idx]).all()
     for t in splits.train:
@@ -98,15 +100,47 @@ def test_embargo_on_both_sides_of_a_window():
 
 
 def test_unused_periods_are_ignored():
-    """Kriz katmanı: test penceresinden sonrası hiçbir bölüme girmez."""
+    """Kriz katmanı: test penceresinden sonrası hiçbir bölüme girmez; test penceresi yine de tam kullanılır,
+    çünkü son günlerin hedefi kullanılmayan döneme taşır (sızıntı değildir)."""
     panel = DailyView().build(make_returns())
     spec = SplitSpec(train=[(None, "2008-12-31")], val=[("2009-01-01", "2009-06-30")],
                      test=[("2009-07-01", "2009-09-30")], embargo=DEFAULT_EMBARGO["daily"])
     splits = make_splits(panel, spec, lookback=20)
     check_split_invariants(panel, splits)
-    last_test_day = panel.dates[splits.test.max()]
-    assert last_test_day <= pd.Timestamp("2009-09-30") - pd.offsets.BDay(panel.horizon)
-    assert panel.dates[np.concatenate([splits.train, splits.val, splits.test])].max() == last_test_day
+    window = (panel.dates >= "2009-07-01") & (panel.dates <= "2009-09-30")
+    assert np.array_equal(splits.test, np.flatnonzero(window)), "test penceresinin bütün günleri kullanılmalı"
+    assert panel.dates[np.concatenate([splits.train, splits.val, splits.test])].max() == panel.dates[window].max()
+    val_end = np.flatnonzero(panel.dates <= "2009-06-30").max()
+    assert splits.val.max() == val_end - panel.horizon, "val hedefi test penceresine taşmamalı"
+
+
+def test_target_never_crosses_into_another_split():
+    """Arada kullanılmayan dönem olsa bile hedef penceresi başka bir bölüme ulaşamaz."""
+    panel = DailyView().build(make_returns())
+    spec = SplitSpec(train=[(None, "2008-12-31")], val=[("2009-01-05", "2009-06-30")],
+                     test=[("2009-07-03", "2009-09-30")])      # train→val ve val→test arasında 1–2 boş gün
+    splits = make_splits(panel, spec, lookback=20)
+    check_split_invariants(panel, splits)
+    test_start = np.flatnonzero(panel.dates >= "2009-07-03").min()
+    assert splits.val.max() == test_start - panel.horizon - 1
+
+
+def test_walk_forward_specs():
+    specs = walk_forward_specs(2017, 2019, val_years=6, embargo=1)
+    assert [s.name for s in specs] == ["y2017", "y2018", "y2019"]
+    b = SplitSpec.sequential("2010-12-31", "2016-12-31", embargo=1)
+    assert specs[0].train == b.train and specs[0].val == b.val
+    assert specs[2].train[0][1] == pd.Timestamp("2012-12-31")
+    assert specs[2].val[0] == (pd.Timestamp("2013-01-01"), pd.Timestamp("2018-12-31"))
+    assert specs[2].test[0] == (pd.Timestamp("2019-01-01"), pd.Timestamp("2019-12-31"))
+
+    panel = MonthlyView().build(make_returns(n_days=3000, start="2001-01-02"))   # 2001 → 2012
+    folds = [make_splits(panel, s, lookback=6) for s in walk_forward_specs(2009, 2011, val_years=2, embargo=1)]
+    for splits in folds:
+        check_split_invariants(panel, splits)
+        assert splits.sizes()["test"] == 12, "her test yılının 12 ayı da kullanılmalı"
+    tests = np.concatenate([f.test for f in folds])
+    assert np.all(np.diff(tests) == 1), "katmanların test ayları kesintisiz ve çakışmasız olmalı"
 
 
 # ------------------------------------------------------------- ölçekleme
@@ -174,3 +208,27 @@ def test_real_data_sequential_split_sizes():
     assert monthly.panel.dates[monthly.splits.test[-1]] == pd.Timestamp("2026-08-31")
     xb, yb = monthly.dataset("test").get([0])
     assert xb.shape == (1, 12, 49, 3) and yb.shape == (1, 49)
+
+    # A düzeni: 10 yıllık walk-forward katmanları B'nin test aylarının aynısını kapsar.
+    folds = [make_splits(monthly.panel, s, lookback=12) for s in walk_forward_specs(2017, 2026, 6, embargo=1)]
+    assert [f.sizes()["train"] for f in folds] == [299 + 12 * i for i in range(10)]
+    assert np.array_equal(np.concatenate([f.test for f in folds]), monthly.splits.test)
+
+
+def test_real_data_daily_crisis_fold_sizes():
+    if not RETURNS_CSV.exists():
+        return
+    panel = DailyView().build(load_returns(RETURNS_CSV, "1985-01-01", "2026-09-30"))
+    E = DEFAULT_EMBARGO["daily"]
+    folds = {
+        "covid": SplitSpec(train=[(None, "2018-12-31")], val=[("2019-01-01", "2019-12-31")],
+                           test=[("2020-02-20", "2020-06-30")], embargo=E),
+        "svb": SplitSpec(train=[(None, "2021-12-31")], val=[("2022-01-01", "2022-12-31")],
+                         test=[("2023-03-01", "2023-05-31")], embargo=E),
+        "last_year": SplitSpec(train=[(None, "2024-09-30")], val=[("2024-10-01", "2025-09-30")],
+                               test=[("2025-10-01", "2026-09-30")], embargo=E),
+    }
+    sizes = {name: make_splits(panel, spec, lookback=60).sizes() for name, spec in folds.items()}
+    assert sizes == {"covid": {"train": 8463, "val": 252, "test": 92},
+                     "svb": {"train": 9220, "val": 251, "test": 64},
+                     "last_year": {"train": 9909, "val": 245, "test": 246}}, sizes

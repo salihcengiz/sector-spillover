@@ -1,0 +1,59 @@
+# Aylık görünüm, A düzeni: walk-forward. Test dönemi 2017-01 → 2026-09 (B ile aynı).
+# Her test yılı Y için modeller yeniden eğitilir: train ≤ Y-7, val Y-6 … Y-1 (6 yıl, B ile aynı uzunluk),
+# test Y. Yani train penceresi her yıl genişler. İlk katmanın (y2017) train ve val dönemleri B ile aynıdır.
+# Model ve eğitim ayarları B ile aynıdır; tek fark bölme.
+name: lstm_monthly_a
+output_dir: outputs/runs
+
+data:
+  returns_csv: data/processed/49_sektor_gunluk_getiri_temiz.csv
+  start: "1985-01-01"
+  end: "2026-09-30"
+  frequency: monthly
+  view:
+    features: [mean, max, min]        # isteğe bağlı 4. özellik: std
+
+split:
+  embargo: 1                          # ay
+  walk_forward:
+    first_test_year: 2017
+    last_test_year: 2026
+    val_years: 6
+
+prep:
+  lookback: 12                        # ay
+  clip: 10.0
+
+baselines:
+  names: [persistence, ewma, har_own, har_market, ridge_all]
+
+models:
+  - name: lstm_cross
+    type: cross_lstm
+    params: {hidden: 16, layers: 1, dropout: 0.3}
+  - name: lstm_own
+    type: own_lstm
+    params: {hidden: 16, layers: 1, dropout: 0.3, embed_dim: 4}
+
+training:
+  epochs: 300
+  batch_size: 32
+  lr: 1.0e-3
+  weight_decay: 1.0e-3
+  grad_clip: 1.0
+  patience: 20
+  device: auto
+  log_every: 25
+
+seeds: [0, 1, 2, 3, 4]
+
+evaluation:
+  reference: har_own
+  pairs: [[lstm_cross, lstm_own]]
+  # Birleşik (pooled) test tahminlerinin içinden ayrıca raporlanan dönemler.
+  # Aylık veride bunlar çok az örnek içerir (COVID 5, SVB 3 ay): yalnızca betimleyici.
+  slices:
+    covid: ["2020-02-01", "2020-06-30"]
+    rate_2022: ["2022-01-01", "2022-12-31"]
+    svb: ["2023-03-01", "2023-05-31"]
+    last_year: ["2025-10-01", "2026-09-30"]

@@ -73,3 +73,20 @@ def test_evaluate_tables():
     except ValueError:
         return
     raise AssertionError("NaN tahmin hata vermeliydi")
+
+
+def test_evaluate_accepts_per_period_benchmark():
+    dates = pd.bdate_range("2010-01-01", periods=120)
+    rng = np.random.default_rng(4)
+    panel = DailyView().build(pd.DataFrame(rng.normal(size=(120, 2)).round(2), index=dates, columns=["A", "B"]))
+    idx = np.arange(30, 110)
+    bench = np.full(panel.y.shape, np.nan)
+    bench[30:70], bench[70:110] = 0.1, -0.3
+    out = evaluate({"m": panel.log_rv}, panel, idx, benchmark=bench)["per_sector"]
+    expected = oos_r2(panel.y[idx], panel.log_rv[idx], bench[idx])
+    assert np.allclose(out["oos_r2"], expected)
+    try:
+        evaluate({"m": panel.log_rv}, panel, np.arange(20, 110), benchmark=bench)
+    except ValueError:
+        return
+    raise AssertionError("tanımsız kıyas hata vermeliydi")

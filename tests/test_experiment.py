@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from spillover.experiment import apply_quick, run_experiment, split_folds
+from spillover.evaluation import evaluate
+from spillover.experiment import POOLED, apply_quick, run_experiment, split_folds
 from spillover.prep import SplitSpec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,8 @@ def make_returns(n_days=700, n_sectors=4, seed=5):
 def test_split_folds_from_config():
     folds = split_folds(CONFIG["split"])
     assert [n for n, _ in folds] == ["a", "b"] and all(s.embargo == 5 for _, s in folds)
+    wf = split_folds({"embargo": 1, "walk_forward": {"first_test_year": 2017, "last_test_year": 2026, "val_years": 6}})
+    assert [n for n, _ in wf] == [f"y{y}" for y in range(2017, 2027)] and all(s.embargo == 1 for _, s in wf)
     (name, spec), = split_folds({"train_end": "2010-12-31", "val_end": "2016-12-31", "embargo": 1})
     assert name == "main" and spec == SplitSpec.sequential("2010-12-31", "2016-12-31", embargo=1, name="main")
     try:
@@ -78,10 +81,37 @@ def test_baselines_only_run_writes_outputs():
             preds = np.load(d / "predictions.npz")
             assert preds["y"].shape == preds["pred__har_own"].shape
         all_ = pd.read_csv(run_dir / "summary_all.csv")
-        assert set(all_["fold"]) == {"a", "b"}
+        assert set(all_["fold"]) == {"a", "b", POOLED}
+
+        # Birleşik değerlendirme: iki katmanın test örnekleri, her biri kendi train ortalamasıyla.
+        pooled = np.load(run_dir / POOLED / "predictions.npz")
+        fold_idx = [np.load(run_dir / f / "predictions.npz")["idx"] for f in ("a", "b")]
+        assert np.array_equal(pooled["idx"], np.concatenate(fold_idx))
+        summary = pd.read_csv(run_dir / POOLED / "summary.csv", index_col=0)
+        y, p = pooled["y"], pooled["pred__har_own"]
+        assert np.isclose(summary.loc["har_own", "mse"], np.mean((y - p) ** 2))
 
         only_b = run_experiment(CONFIG, root=Path(tmp), returns=make_returns(), folds=["b"], log=lambda _: None)
         assert not (only_b / "a").exists() and (only_b / "b").exists()
+
+
+def test_slices_and_single_fold():
+    cfg = {**CONFIG, "split": CONFIG["split"]["folds"][0],
+           "evaluation": {"reference": "har_own", "slices": {"q3": ["2009-07-01", "2009-09-30"],
+                                                            "empty": ["2015-01-01", "2015-02-01"]}}}
+    with tempfile.TemporaryDirectory() as tmp:
+        run_dir = run_experiment(cfg, root=Path(tmp), returns=make_returns(), log=lambda _: None)
+        assert not (run_dir / POOLED).exists(), "tek katmanda pooled klasörü olmamalı"
+        slices = pd.read_csv(run_dir / "slices.csv")
+        assert set(slices["slice"]) == {"q3"}, "örneği olmayan dönem atlanmalı"
+        preds = np.load(run_dir / "a" / "predictions.npz")
+        dates = pd.to_datetime(preds["dates"])
+        in_q3 = dates <= "2009-09-30"
+        row = slices.set_index("model").loc["har_own"]
+        assert row["n"] == in_q3.sum()
+        assert np.isclose(row["mse"], np.mean((preds["y"][in_q3] - preds["pred__har_own"][in_q3]) ** 2))
+        dm = pd.read_csv(run_dir / "slices_dm.csv")
+        assert set(dm["sector"]) == {"ALL"}
 
 
 def test_end_to_end_with_lstm():

@@ -15,7 +15,7 @@ import numpy as np
 
 from ..data.panel import Panel
 from .scaling import Standardizer
-from .splits import DEFAULT_EMBARGO, SPLIT_NAMES, UNUSED, SplitSpec, Splits, make_splits
+from .splits import DEFAULT_EMBARGO, SPLIT_NAMES, UNUSED, SplitSpec, Splits, make_splits, walk_forward_specs
 from .windows import WindowDataset
 
 
@@ -43,4 +43,4 @@ def prepare(panel: Panel, spec, lookback: int, clip: float = 10.0) -> PreparedDa
 
 
 __all__ = ["DEFAULT_EMBARGO", "SPLIT_NAMES", "UNUSED", "PreparedData", "SplitSpec", "Splits",
-           "Standardizer", "WindowDataset", "make_splits", "prepare"]
+           "Standardizer", "WindowDataset", "make_splits", "prepare", "walk_forward_specs"]

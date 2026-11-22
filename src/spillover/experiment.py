@@ -3,25 +3,36 @@
 Config (YAML ya da sözlük) bölümleri:
   name, output_dir
   data:      returns_csv, start, end, frequency (daily | monthly), view (görünüm parametreleri)
-  split:     tek bölme (train_end/val_end ya da train/val/test aralıkları + embargo)
-             ya da {embargo, folds: [{name, train, val, test}, ...]}. Her katman (fold) için
-             bütün akış ayrı çalışır: ölçekleyici ve modeller yalnızca o katmanın train'ini görür.
+  split:     üç biçimden biri; her katman (fold) için bütün akış ayrı çalışır, ölçekleyici ve
+             modeller yalnızca o katmanın train'ini görür:
+               tek bölme      : {train_end, val_end, embargo} ya da {train, val, test, embargo}
+               katman listesi : {embargo, folds: [{name, train, val, test}, ...]}
+               walk-forward   : {embargo, walk_forward: {first_test_year, last_test_year, val_years}}
   prep:      lookback, clip
   baselines: names, params
   models:    [{name, type, params}, ...]   (boş bırakılırsa yalnızca kıyas modelleri çalışır; torch gerekmez)
   training:  TrainConfig alanları
-  seeds:     [0, 1, ...]   her model her seed ile ayrı eğitilir; tahminlerin ortalaması da bir model olarak raporlanır
-  evaluation: reference (DM ve göreli MSE için), pairs ([[a, b], ...] ek DM karşılaştırmaları)
+  seeds:     [0, 1, ...]   her model her seed ile ayrı eğitilir; tahminlerin ortalaması model olarak raporlanır
+  evaluation:
+    reference: DM ve göreli MSE için model adı
+    pairs:     [[a, b], ...] ek DM karşılaştırmaları
+    slices:    {ad: [başlangıç, bitiş], ...} birleşik test tahminleri içinden ayrıca raporlanan dönemler
 
-Çıktılar: <output_dir>/<zaman>_<name>/<katman>/ altında
-  summary.csv, per_sector.csv, dm.csv, seeds.csv, history.csv, predictions.npz, scaler.npz,
-  checkpoints/<model>_s<seed>.pt; kökte config.yaml (ya da config.json) ve tüm katmanların summary_all.csv'si.
+Çıktılar: <output_dir>/<zaman>_<name>/ altında
+  <katman>/  summary.csv, per_sector.csv, dm.csv, seeds.csv, history.csv, predictions.npz, scaler.npz,
+             checkpoints/<model>_s<seed>.pt
+  pooled/    birden çok katman varsa: bütün katmanların test tahminleri tek seri olarak
+             (summary.csv, per_sector.csv, dm.csv, predictions.npz)
+  slices.csv, slices_dm.csv   evaluation.slices verildiyse
+  summary_all.csv             bütün katmanların (ve pooled'ın) özet tablosu
+  config.yaml (ya da config.json)
 """
 from __future__ import annotations
 
 import copy
 import json
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -30,8 +41,11 @@ import pandas as pd
 
 from .baselines import fit_predict
 from .data import build_view, load_returns
-from .evaluation import evaluate, train_mean
-from .prep import SplitSpec, prepare
+from .data.panel import Panel
+from .evaluation import ALL_SECTORS, evaluate, train_mean
+from .prep import SplitSpec, prepare, walk_forward_specs
+
+POOLED = "pooled"
 
 
 def load_config(path) -> dict:
@@ -43,18 +57,20 @@ def load_config(path) -> dict:
 def split_folds(split_cfg: dict) -> List[Tuple[str, SplitSpec]]:
     """Config'teki split bölümünden (katman adı, SplitSpec) listesi üretir."""
     split_cfg = dict(split_cfg)
+    embargo = split_cfg.get("embargo", 0)
+    if "walk_forward" in split_cfg:
+        return [(s.name, s) for s in walk_forward_specs(**split_cfg["walk_forward"], embargo=embargo)]
     if "folds" not in split_cfg:
         name = split_cfg.pop("name", "main")
         return [(name, SplitSpec.from_config({**split_cfg, "name": name}))]
-    embargo = split_cfg.get("embargo", 0)
     folds = []
     for i, fold in enumerate(split_cfg["folds"]):
         fold = {"embargo": embargo, **fold}
         fold.setdefault("name", f"fold{i}")
         folds.append((fold["name"], SplitSpec.from_config(fold)))
     names = [n for n, _ in folds]
-    if len(set(names)) != len(names):
-        raise ValueError(f"Katman adları benzersiz olmalı: {names}.")
+    if len(set(names)) != len(names) or POOLED in names:
+        raise ValueError(f"Katman adları benzersiz olmalı ve {POOLED!r} olmamalı: {names}.")
     return folds
 
 
@@ -74,6 +90,14 @@ def _write_config(cfg: dict, path: Path) -> None:
         path.with_suffix(".yaml").write_text(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False), encoding="utf-8")
     except ImportError:
         path.with_suffix(".json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
+
+
+@dataclass
+class FoldResult:
+    tables: Dict[str, pd.DataFrame]
+    predictions: Dict[str, np.ndarray]   # {model: (T, N)}; yalnızca test satırları dolu
+    benchmark: np.ndarray                # (N,) bu katmanın train ortalaması
+    test_idx: np.ndarray
 
 
 def _train_models(cfg: dict, data, fold_dir: Path, log: Callable[[str], None]):
@@ -110,11 +134,34 @@ def _train_models(cfg: dict, data, fold_dir: Path, log: Callable[[str], None]):
     return ensemble, per_seed, history, info
 
 
-def run_fold(cfg: dict, returns: pd.DataFrame, fold_name: str, spec: SplitSpec, fold_dir: Path,
-             log: Callable[[str], None] = print) -> Dict[str, pd.DataFrame]:
+def _evaluate_all(preds: Dict[str, np.ndarray], panel: Panel, idx: np.ndarray, bench: np.ndarray,
+                  eval_cfg: dict) -> Dict[str, pd.DataFrame]:
+    """Referansa karşı tablolar + config'teki ek DM çiftleri."""
+    tables = evaluate(preds, panel, idx, bench, reference=eval_cfg.get("reference"))
+    extra_dm = [evaluate({a: preds[a], b: preds[b]}, panel, idx, bench, reference=b)["dm"]
+                for a, b in eval_cfg.get("pairs", []) if a in preds and b in preds]
+    tables["dm"] = pd.concat([tables["dm"], *extra_dm], ignore_index=True)
+    return tables
+
+
+def _save_predictions(path: Path, panel: Panel, idx: np.ndarray, preds: Dict[str, np.ndarray]) -> None:
+    # Tarih ve sektör adları düz metin dizisi (object değil): np.load allow_pickle olmadan açabilsin.
+    np.savez_compressed(path, dates=np.asarray(panel.dates[idx].strftime("%Y-%m-%d"), dtype=str), idx=idx,
+                        sectors=np.asarray(panel.sectors, dtype=str), y=panel.y[idx],
+                        **{f"pred__{k.replace('/', '__')}": v[idx] for k, v in preds.items()})
+
+
+def _save_tables(tables: Dict[str, pd.DataFrame], out_dir: Path) -> None:
+    tables["summary"].to_csv(out_dir / "summary.csv")
+    for key in ("per_sector", "dm", "seeds", "history"):
+        if key in tables:
+            tables[key].to_csv(out_dir / f"{key}.csv", index=False)
+
+
+def run_fold(cfg: dict, panel: Panel, fold_name: str, spec: SplitSpec, fold_dir: Path,
+             log: Callable[[str], None] = print) -> FoldResult:
     fold_dir.mkdir(parents=True, exist_ok=True)
-    data_cfg, prep_cfg = cfg["data"], cfg.get("prep", {})
-    panel = build_view(data_cfg["frequency"], **data_cfg.get("view", {})).build(returns)
+    prep_cfg = cfg.get("prep", {})
     data = prepare(panel, spec, lookback=int(prep_cfg.get("lookback", 60)), clip=prep_cfg.get("clip", 10.0))
     splits = data.splits
     log(f"[{fold_name}] {panel.frequency}, örnekler {splits.sizes()}, embargo {spec.embargo}")
@@ -127,12 +174,7 @@ def run_fold(cfg: dict, returns: pd.DataFrame, fold_name: str, spec: SplitSpec, 
         preds.update(lstm_preds)
 
     bench = train_mean(panel, splits)
-    eval_cfg = cfg.get("evaluation", {})
-    tables = evaluate(preds, panel, splits.test, bench, reference=eval_cfg.get("reference"))
-    extra_dm = [evaluate({a: preds[a], b: preds[b]}, panel, splits.test, bench, reference=b)["dm"]
-                for a, b in eval_cfg.get("pairs", []) if a in preds and b in preds]
-    tables["dm"] = pd.concat([tables["dm"], *extra_dm], ignore_index=True)
-
+    tables = _evaluate_all(preds, panel, splits.test, bench, cfg.get("evaluation", {}))
     seeds = pd.DataFrame(info)
     if per_seed:
         seed_summary = evaluate(per_seed, panel, splits.test, bench)["summary"].reset_index(drop=True)
@@ -140,17 +182,54 @@ def run_fold(cfg: dict, returns: pd.DataFrame, fold_name: str, spec: SplitSpec, 
     tables["seeds"] = seeds
     tables["history"] = pd.DataFrame(history)
 
-    tables["summary"].to_csv(fold_dir / "summary.csv")
-    for key in ("per_sector", "dm", "seeds", "history"):
-        tables[key].to_csv(fold_dir / f"{key}.csv", index=False)
-    test = splits.test
-    np.savez_compressed(fold_dir / "predictions.npz", dates=panel.dates[test].strftime("%Y-%m-%d").to_numpy(),
-                        idx=test, sectors=np.array(panel.sectors), y=panel.y[test],
-                        **{f"pred__{k.replace('/', '__')}": v[test] for k, v in {**preds, **per_seed}.items()})
+    _save_tables(tables, fold_dir)
+    _save_predictions(fold_dir / "predictions.npz", panel, splits.test, {**preds, **per_seed})
     np.savez(fold_dir / "scaler.npz", **{k: np.asarray(v, dtype=float) for k, v in data.scaler.state_dict().items()
                                          if v is not None})
     log(f"[{fold_name}] test sonuçları:\n{tables['summary'].round(4).to_string()}")
-    return tables
+    # Katmanlar arası birleştirme için yalnızca test satırları tutulur.
+    test_only = {}
+    for name, p in preds.items():
+        q = np.full(p.shape, np.nan)
+        q[splits.test] = p[splits.test]
+        test_only[name] = q
+    return FoldResult(tables=tables, predictions=test_only, benchmark=bench, test_idx=splits.test)
+
+
+def pool_folds(results: Dict[str, FoldResult], shape: Tuple[int, int]):
+    """Katmanların test tahminlerini tek (T, N) seriye birleştirir. Test dönemleri çakışamaz.
+
+    Dönüş: (tahminler, kıyas (T, N): her satırda o katmanın train ortalaması, birleşik örnek indeksleri).
+    """
+    idx = np.concatenate([r.test_idx for r in results.values()])
+    if len(np.unique(idx)) != len(idx):
+        raise ValueError("Katmanların test dönemleri çakışıyor; birleştirilemez.")
+    names = set.intersection(*(set(r.predictions) for r in results.values()))
+    preds = {n: np.full(shape, np.nan) for n in names}
+    bench = np.full(shape, np.nan)
+    for r in results.values():
+        bench[r.test_idx] = r.benchmark
+        for n in names:
+            preds[n][r.test_idx] = r.predictions[n][r.test_idx]
+    order = list(next(iter(results.values())).predictions)          # model sırasını koru
+    return {n: preds[n] for n in order if n in preds}, bench, np.sort(idx)
+
+
+def evaluate_slices(preds: Dict[str, np.ndarray], panel: Panel, idx: np.ndarray, bench: np.ndarray,
+                    slices: Dict[str, list], eval_cfg: dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Belirli dönemler (örn. COVID) için özet ve 49 sektör ortalamalı DM tabloları."""
+    summaries, dms = [], []
+    for name, (start, end) in slices.items():
+        dates = panel.dates[idx]
+        sub = idx[(dates >= pd.Timestamp(start)) & (dates <= pd.Timestamp(end))]
+        if len(sub) < 2:
+            continue
+        tables = _evaluate_all(preds, panel, sub, bench, eval_cfg)
+        summaries.append(tables["summary"].reset_index().assign(slice=name, n=len(sub)))
+        dm = tables["dm"]
+        dms.append(dm[dm["sector"] == ALL_SECTORS].assign(slice=name))
+    return (pd.concat(summaries, ignore_index=True) if summaries else pd.DataFrame(),
+            pd.concat(dms, ignore_index=True) if dms else pd.DataFrame())
 
 
 def run_experiment(cfg: dict, root: Path = Path("."), quick: bool = False, returns: Optional[pd.DataFrame] = None,
@@ -161,6 +240,7 @@ def run_experiment(cfg: dict, root: Path = Path("."), quick: bool = False, retur
     data_cfg = cfg["data"]
     if returns is None:
         returns = load_returns(root / data_cfg["returns_csv"], data_cfg.get("start"), data_cfg.get("end"))
+    panel = build_view(data_cfg["frequency"], **data_cfg.get("view", {})).build(returns)
 
     base = root / cfg.get("output_dir", "outputs/runs") / f"{time.strftime('%Y%m%d-%H%M%S')}_{cfg.get('name', 'run')}"
     run_dir, k = base, 1
@@ -170,13 +250,35 @@ def run_experiment(cfg: dict, root: Path = Path("."), quick: bool = False, retur
     run_dir.mkdir(parents=True)
     _write_config(cfg, run_dir / "config")
 
-    summaries = []
+    results: Dict[str, FoldResult] = {}
     for fold_name, spec in split_folds(cfg["split"]):
         if folds and fold_name not in folds:
             continue
-        tables = run_fold(cfg, returns, fold_name, spec, run_dir / fold_name, log)
-        summaries.append(tables["summary"].reset_index().assign(fold=fold_name))
-    if summaries:
-        pd.concat(summaries, ignore_index=True).to_csv(run_dir / "summary_all.csv", index=False)
+        results[fold_name] = run_fold(cfg, panel, fold_name, spec, run_dir / fold_name, log)
+    if not results:
+        raise ValueError(f"Çalıştırılacak katman yok (seçilen: {folds}).")
+
+    summaries = [r.tables["summary"].reset_index().assign(fold=name) for name, r in results.items()]
+    eval_cfg = cfg.get("evaluation", {})
+    if len(results) > 1:
+        preds, bench, idx = pool_folds(results, panel.y.shape)
+        pooled_dir = run_dir / POOLED
+        pooled_dir.mkdir()
+        tables = _evaluate_all(preds, panel, idx, bench, eval_cfg)
+        _save_tables(tables, pooled_dir)
+        _save_predictions(pooled_dir / "predictions.npz", panel, idx, preds)
+        summaries.append(tables["summary"].reset_index().assign(fold=POOLED))
+        log(f"[{POOLED}] {len(results)} katmanın birleşik test sonuçları ({len(idx)} örnek):\n"
+            f"{tables['summary'].round(4).to_string()}")
+    else:
+        (only,) = results.values()
+        preds, bench, idx = only.predictions, only.benchmark, only.test_idx
+
+    if eval_cfg.get("slices"):
+        slice_summary, slice_dm = evaluate_slices(preds, panel, idx, bench, eval_cfg["slices"], eval_cfg)
+        slice_summary.to_csv(run_dir / "slices.csv", index=False)
+        slice_dm.to_csv(run_dir / "slices_dm.csv", index=False)
+
+    pd.concat(summaries, ignore_index=True).to_csv(run_dir / "summary_all.csv", index=False)
     log(f"Çıktılar: {run_dir}")
     return run_dir
