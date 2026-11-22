@@ -14,3 +14,10 @@ data/raw/
 
 # Deney çıktıları (sonuçlar, grafikler, checkpoint'ler)
 outputs/
+
+# LaTeX ara dosyaları (reports/ altında yalnızca .tex ve .pdf tutulur)
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz

@@ -1,0 +1,298 @@
+% Aşama 1 ara raporu: veri hazırlığı, bölme düzenleri, modeller ve ilk bulgular.
+% Derleme: pdflatex asama1_rapor.tex (iki kez). Gerekli paketler: babel-turkish, booktabs, geometry, hyperref.
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[turkish,shorthands=off]{babel}
+\usepackage{lmodern}
+\usepackage[margin=2.3cm]{geometry}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{caption}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage[hidelinks]{hyperref}
+
+\setlist{itemsep=2pt, topsep=4pt}
+\captionsetup{font=small, labelfont=bf}
+\newcommand{\Rsq}{R$^2$}
+\newcommand{\best}[1]{\textbf{#1}}
+
+\title{Sektörler Arası Risk Yayılımı\\[2pt]\large Aşama 1 Ara Raporu: Veri Hazırlığı, Kıyas Modelleri ve Klasik LSTM}
+\author{} % yazar adı eklenebilir
+\date{22 Kasım 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+Fama--French 49 sektör portföyünün günlük getirileri kullanılarak, her sektörün gelecek dönemdeki riski
+(log gerçekleşen varyans) tahmin edildi. Sektörün yalnızca kendi geçmişini kullanan modeller, diğer
+sektörlerin bilgisini de kullanan modellerle karşılaştırıldı. Aylık görünümde iki bölme düzeninde de
+(tek bölme ve walk-forward) aynı sonuç çıktı: sektör başına ağırlık paylaşan LSTM, klasik HAR modeliyle
+istatistiksel olarak berabere kaldı. Bütün sektörleri tek bir girdi olarak gören LSTM ise aşırı öğrendi ve
+her yılda HAR'ın gerisinde kaldı. Piyasa genelinin risk bilgisini ekleyen HAR+piyasa modeli günlük veride
+HAR'ı anlamlı biçimde geçti. Bu modelin en büyük kazancı stres dönemlerinde görüldü. Günlük LSTM koşuları
+henüz yapılmadı (GPU kotası bekleniyor).
+\end{abstract}
+
+% =====================================================================
+\section{Amaç}
+Araştırma sorusu: bir sektörde başlayan piyasa şoku hangi koşullarda başka sektörlere yayılıyor, ve
+sonraki işlem günlerinde hangi sektörlerde risk artıyor? Aşama~1'in amacı ortak bir veri hattı ve
+değerlendirme düzeni kurmak, güçlü kıyas modellerini belirlemek ve klasik bir LSTM ile şu soruyu
+cevaplamaktır: \emph{diğer sektörlerin geçmişi, bir sektörün gelecekteki riskini tahmin etmeye yardım ediyor mu?}
+
+% =====================================================================
+\section{Veri}
+\begin{itemize}
+  \item \textbf{Kaynak:} Kenneth R.\ French Data Library, \emph{49 Industry Portfolios [Daily]} (CRSP, 202609 sürümü).
+        NYSE, AMEX ve NASDAQ hisselerinden oluşan değer ağırlıklı portföyler; temettü dahil yüzde getiriler, 2 ondalık.
+  \item \textbf{Dönem:} 1985-01-02 $\to$ 2026-09-30; 10\,517 işlem günü, 501 ay. Bu dönemde eksik değer yok.
+  \item \textbf{Sektörler:} 49 sektör veri setindeki ad ve sırasıyla kullanıldı. Hiçbir sektör birleştirilmedi,
+        bölünmedi ya da gruplanmadı.
+  \item \textbf{Yuvarlama:} 2\,188 hücre (\%0.4) tam olarak 0.00. Bunlar eksik veri değil, 2 ondalığa yuvarlamanın
+        sonucu. Log dönüşümlerinde $\varepsilon = 0.01\ (\%^2)$ eklendi.
+\end{itemize}
+
+\paragraph{Hedefin seçimi.} Ön analizde getirinin kendisi bir gün sonrası için tahmin edilemez çıktı:
+bir günlük gecikmeli korelasyon kendi sektörüyle $-0.010$, diğer sektörlerle ortalama $-0.016$.
+Getirinin büyüklüğü ($|r|$) ise belirgin biçimde tahmin edilebilir: kendi sektörüyle $0.258$, diğer sektörlerle $0.203$.
+Ayrıca piyasa genelindeki bir şoktan sonraki gün diğer sektörlerin riski normalin 1.6--1.75 katına çıkarken,
+yalnızca tek bir sektöre özgü şoklarda bu oran 0.9--1.2 kat. Bu nedenle hedef olarak \textbf{ileri risk} seçildi.
+
+% =====================================================================
+\section{Görünümler ve veri hazırlığı}
+Aynı model, günlük ya da aylık görünümden gelen veriyle beslenebilecek şekilde katmanlı bir yapı kuruldu:
+kaynak $\to$ görünüm $\to$ ortak panel $\to$ bölme, ölçekleme ve pencereleme $\to$ model.
+Model, verinin frekansını bilmez; $(B, L, N, F)$ boyutunda girdi alır ve $(B, N)$ tahmin üretir.
+
+\begin{table}[h]
+\centering\small
+\caption{İki görünüm. $r_t$: günlük yüzde getiri; RV$_k$: son $k$ günün $r^2$ ortalaması.}
+\label{tab:views}
+\begin{tabular}{@{}p{2.6cm}p{6.2cm}p{6.2cm}@{}}
+\toprule
+ & \textbf{Günlük} & \textbf{Aylık} (danışman önerisi) \\
+\midrule
+Dönem & işlem günü (10\,517) & takvim ayı (501) \\
+Özellikler & $r_t$,\ $\log(r_t^2+\varepsilon)$,\ $\log(\text{RV}_5+\varepsilon)$,\ $\log(\text{RV}_{22}+\varepsilon)$ &
+             ayın ortalama, en yüksek ve en düşük günlük getirisi \\
+Hedef $y_t$ & $\log\big(\overline{r^2}_{t+1\ldots t+5}+\varepsilon\big)$: sonraki 5 günün riski &
+              $\log\big(\overline{r^2}_{\text{sonraki ay}}+\varepsilon\big)$: sonraki ayın riski \\
+Girdi penceresi & 60 gün $\Rightarrow$ $(60, 49, 4)$ & 12 ay $\Rightarrow$ $(12, 49, 3)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Girdiler her (sektör, özellik) çifti için yalnızca train verisinin ortalama ve standart sapmasıyla standartlaştırıldı
+ve $\pm10$'da kırpıldı. Hedef de sektör bazında standartlaştırıldı; tahminler değerlendirmeden önce log-RV
+ölçeğine geri çevrildi. Özelliklerin yalnızca $t$ ve öncesine baktığı birim testleriyle doğrulandı.
+
+% =====================================================================
+\section{Train / val / test bölmesi}
+Danışmanın 6 yıllık testi uzun bulması üzerine üç düzen tanımlandı (Tablo~\ref{tab:splits}). Hepsinde iki koruma var:
+\begin{itemize}
+  \item \textbf{Purge:} Bir örneğin hedef penceresi başka bir bölüme (örneğin train'den val'e) taşamaz.
+  \item \textbf{Embargo:} Train örnekleri val/test dönemlerine en az 22 işlem günü (günlük) ya da 1 ay (aylık) uzak kalır.
+\end{itemize}
+Model ve ölçekleyici her katmanda yalnızca o katmanın train verisiyle eğitilir. Val, erken durdurma ve Ridge'in ceza
+katsayısını seçmek için kullanılır.
+
+\begin{table}[h]
+\centering\small
+\caption{Bölme düzenleri ve kullanılabilir örnek sayıları (train / val / test).}
+\label{tab:splits}
+\begin{tabular}{@{}llp{6.6cm}r@{}}
+\toprule
+\textbf{Düzen} & \textbf{Görünüm} & \textbf{Dönemler} & \textbf{Örnek sayısı} \\
+\midrule
+B (tek bölme) & günlük & train $\le$ 2010, val 2011--2016, test 2017-01 $\to$ 2026-09 & 6\,451 / 1\,505 / 2\,444 \\
+B (tek bölme) & aylık  & aynı dönemler & 299 / 71 / 116 ay \\
+A (walk-forward) & aylık & 10 katman. Her test yılı $Y$ (2017--2026) için train $\le Y{-}7$, val $Y{-}6 \ldots Y{-}1$,
+                         test $Y$. Train her yıl 12 ay büyür. Toplam test, B ile aynı 116 ay. & 299--407 / 71 / 12 \\
+Kriz pencereleri & günlük & COVID 2020-02-20 $\to$ 06-30 (train $\le$ 2018, val 2019) & 8\,463 / 252 / 92 \\
+                 &        & SVB 2023-03-01 $\to$ 05-31 (train $\le$ 2021, val 2022) & 9\,220 / 251 / 64 \\
+                 &        & Son 1 yıl 2025-10 $\to$ 2026-09 (train $\le$ 2024-09) & 9\,909 / 245 / 246 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% =====================================================================
+\section{Modeller}
+\begin{table}[H]
+\centering\small
+\caption{Modeller. Bütün kıyas modelleri iki görünümde de aynı kodla çalışır; günlük HAR pencereleri 1, 5 ve 22 gün,
+aylık HAR pencereleri 1, 3 ve 12 aydır.}
+\label{tab:models}
+\begin{tabular}{@{}lp{12.4cm}@{}}
+\toprule
+Persistence & Gelecek dönemin riski = son dönemin riski (günlükte son 5 gün, aylıkta bu ay). \\
+EWMA & Üstel ağırlıklı varyans, $\lambda = 0.94$ (günlük) / $0.97$ (aylık). \\
+HAR-kendi & Corsi (2009). Her sektör için ayrı en küçük kareler regresyonu: sektörün üç farklı penceredeki log riski. \\
+HAR+piyasa & HAR-kendi'ye aynı üç değişkenin 49 sektör üzerinden ortalaması eklenir (piyasa göstergesi; gruplama değildir). \\
+Ridge-tüm & Her sektör için 49 sektörün bütün HAR değişkenleri (147 girdi). Ceza katsayısı val'de 13 değerlik ızgaradan seçilir. \\
+\midrule
+LSTM-çapraz & Bütün sektörlerin geçmişini birlikte görür: $(L, 49{\cdot}F)$ $\to$ LSTM $\to$ dropout $\to$ doğrusal katman (49 çıktı).
+              Gizli boyut 64 (günlük) / 16 (aylık), dropout 0.2 / 0.3. \\
+LSTM-kendi & Her sektör yalnızca kendi geçmişini görür; aynı LSTM ağırlıkları paylaşılarak her sektöre ayrı uygulanır.
+             Sektörü ayırt etmek için 8 / 4 boyutlu sektör gömmesi eklenir. Yapı gereği sektörler arası etki sıfırdır. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+\textbf{Eğitim:} Standartlaştırılmış hedefte MSE kaybı; AdamW (öğrenme oranı $10^{-3}$, ağırlık azaltma $10^{-4}$ günlük /
+$10^{-3}$ aylık), gradyan kırpma 1.0, val kaybına göre erken durdurma (sabır 10 / 20, en fazla 100 / 300 epoch).
+Her model 5 farklı seed ile eğitildi; raporlanan tahmin, 5 seed'in ortalamasıdır.
+
+\noindent
+\textbf{Neden iki LSTM?} İki model arasındaki tek fark, diğer sektörlerin geçmişini görüp görmemeleridir.
+Bu nedenle aralarındaki fark, Granger nedenselliğinin doğrusal olmayan bir karşılığı olarak okunabilir.
+
+% =====================================================================
+\section{Değerlendirme ölçütleri}
+\begin{itemize}
+  \item \textbf{OOS \Rsq{}} (ana ölçüt): $1 - \text{SSE}_{\text{model}} / \text{SSE}_{\text{train ortalaması}}$, sektör bazında
+        hesaplanıp 49 sektörün ortalaması alınır. 0 değeri ``hep geçmiş ortalamayı söylemek kadar iyi'' demektir.
+        Walk-forward'da her tahmin, o tarihte bilinen train ortalamasıyla kıyaslanır.
+  \item \textbf{Göreli MSE:} Modelin MSE'si / HAR-kendi'nin MSE'si. 1'in altı HAR'dan iyi demektir.
+  \item \textbf{QLIKE:} Varyans ölçeğinde Patton (2011) kaybı. Riskin eksik tahminini fazla tahmininden daha ağır cezalandırır.
+  \item \textbf{Diebold--Mariano (DM) testi:} Her dönemin 49 sektör ortalamalı kaybı üzerinden yapılır. Newey--West gecikmesi
+        $h-1$ (günlük 4, aylık 0) ve Harvey--Leybourne--Newbold düzeltmesi kullanıldı. İstatistik negatifse ilk model daha iyidir.
+\end{itemize}
+Bir modeli ``başarılı'' saymak için ölçüt: HAR-kendi'yi göreli MSE $<1$ ve DM $p<0.05$ ile geçmesi.
+
+% =====================================================================
+\section{Bulgular}
+
+\subsection{Aylık görünüm: LSTM sonuçları}
+
+\begin{table}[h]
+\centering\small
+\caption{Aylık test sonuçları (2017-01 $\to$ 2026-08, 116 ay). DM sütunu: HAR-kendi'ye karşı istatistik ($p$).
+A için değerler 10 walk-forward katmanının birleşik tahminlerinden hesaplandı.}
+\label{tab:monthly}
+\begin{tabular}{@{}lrrrrrrr@{}}
+\toprule
+ & \multicolumn{3}{c}{\textbf{B (tek bölme)}} & & \multicolumn{3}{c}{\textbf{A (walk-forward)}} \\
+\cmidrule{2-4}\cmidrule{6-8}
+\textbf{Model} & OOS \Rsq & Göreli MSE & DM ($p$) & & OOS \Rsq & Göreli MSE & DM ($p$) \\
+\midrule
+Persistence  & 0.273 & 1.236 & 2.59 (0.010) & & 0.267 & 1.241 & 2.65 (0.008) \\
+EWMA         & 0.094 & 1.568 & 5.95 ($<$0.001) & & 0.085 & 1.575 & 5.96 ($<$0.001) \\
+HAR-kendi    & 0.415 & 1.000 & -- & & 0.413 & 1.000 & -- \\
+HAR+piyasa   & \best{0.424} & \best{0.990} & $-0.70$ (0.482) & & \best{0.424} & \best{0.986} & $-1.00$ (0.317) \\
+Ridge-tüm    & 0.349 & 1.154 & 6.54 ($<$0.001) & & 0.349 & 1.151 & 6.84 ($<$0.001) \\
+LSTM-çapraz  & 0.291 & 1.298 & 5.42 ($<$0.001) & & 0.301 & 1.277 & 5.07 ($<$0.001) \\
+LSTM-kendi   & 0.417 & 1.005 & 0.18 (0.859) & & 0.411 & 1.010 & 0.34 (0.733) \\
+\midrule
+\multicolumn{8}{@{}l}{LSTM-çapraz -- LSTM-kendi: DM $= 7.92$ ($p<0.001$) [B]; \ $6.83$ ($p<0.001$) [A]} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[h]
+\centering\small
+\caption{A düzeni, yıl bazında HAR-kendi'ye göre göreli MSE (her yıl 12 ay; 2026: 8 ay). 1'in altı HAR'dan iyi.}
+\label{tab:yearly}
+\begin{tabular}{@{}lrrrrrrrrrr@{}}
+\toprule
+\textbf{Model} & 2017 & 2018 & 2019 & 2020 & 2021 & 2022 & 2023 & 2024 & 2025 & 2026 \\
+\midrule
+HAR+piyasa  & 0.99 & 0.98 & 1.01 & 0.97 & 1.04 & 0.94 & 0.96 & 1.04 & 1.00 & 0.99 \\
+LSTM-kendi  & 1.22 & 1.06 & 0.89 & 0.99 & 1.10 & 0.98 & 0.93 & 0.97 & 0.98 & 1.17 \\
+LSTM-çapraz & 1.73 & 1.21 & 1.01 & 1.19 & 1.43 & 1.56 & 1.32 & 1.26 & 1.08 & 2.00 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{enumerate}
+  \item \textbf{LSTM-kendi, HAR-kendi ile berabere.} Fark iki düzende de anlamlı değil ($p = 0.86$ ve $0.73$).
+        LSTM-kendi 10 yılın 6'sında HAR'ı geçti, 4'ünde geride kaldı. Seed'ler arası fark çok küçük
+        (val kaybı 0.456--0.460).
+  \item \textbf{LSTM-çapraz aşırı öğreniyor.} Train kaybı 0.35'e inerken val kaybı yaklaşık 40. epoch'ta dibe vurup yükseliyor.
+        Seed'ler arası fark büyük (val kaybı 0.537--0.617). Model 10 yılın hepsinde HAR'dan, iki düzende de LSTM-kendi'den
+        anlamlı derecede kötü. Doğrusal tarafta da aynı tablo var: Ridge-tüm, HAR-kendi'nin gerisinde.
+        Yani 147 girdiyi 299--407 aylık örnekle hiçbir yapı vermeden öğrenmek mümkün olmuyor.
+  \item \textbf{A ile B aynı sonucu veriyor.} Modelleri her yıl yeni veriyle yeniden eğitmek sıralamayı değiştirmedi.
+        Aylık bulgu tek bir bölmeye bağlı değil. Ayrıca y2017 katmanının eğitim kayıtları B koşusuyla birebir aynı;
+        bu, koşuların tekrarlanabilir olduğunu gösteriyor.
+\end{enumerate}
+
+\subsection{Kıyas modelleri: günlük görünüm}
+
+\begin{table}[h]
+\centering\small
+\caption{Günlük kıyas modelleri: OOS \Rsq{} ve HAR-kendi'ye göre göreli MSE. ``Birleşik'': üç kriz/son-yıl penceresi birlikte.}
+\label{tab:daily}
+\begin{tabular}{@{}lrrcrrrr@{}}
+\toprule
+ & \multicolumn{2}{c}{\textbf{B (2017--2026)}} & & \multicolumn{4}{c}{\textbf{Göreli MSE, kriz pencereleri}} \\
+\cmidrule{2-3}\cmidrule{5-8}
+\textbf{Model} & OOS \Rsq & Göreli MSE & & COVID & SVB & Son 1 yıl & Birleşik \\
+\midrule
+Persistence & 0.013 & 1.523 & & 0.878 & 1.601 & 1.678 & 1.374 \\
+EWMA        & 0.283 & 1.107 & & 1.128 & 1.030 & 1.050 & 1.076 \\
+HAR-kendi   & 0.354 & 1.000 & & 1.000 & 1.000 & 1.000 & 1.000 \\
+HAR+piyasa  & \best{0.367} & \best{0.984} & & \best{0.857} & 0.985 & \best{0.988} & \best{0.940} \\
+Ridge-tüm   & 0.338 & 1.038 & & 0.904 & \best{0.973} & 1.117 & 1.019 \\
+\bottomrule
+\end{tabular}\\[4pt]
+\begin{minipage}{0.86\linewidth}\footnotesize
+HAR+piyasa -- HAR-kendi DM: B'de $-2.21$ ($p=0.027$; sektörlerin tek tek testinde 49 sektörün 26'sında anlamlı iyileşme);
+kriz pencereleri birleşik $-1.75$ ($p=0.080$). Kriz pencerelerindeki LSTM koşuları GPU kotası nedeniyle henüz yapılmadı.
+\end{minipage}
+\end{table}
+
+\begin{enumerate}[resume]
+  \item \textbf{Piyasa bilgisi günlük veride yardım ediyor.} HAR+piyasa, HAR-kendi'yi B'de anlamlı biçimde geçti.
+        Kazanç COVID penceresinde en büyük: MSE \%14 daha düşük. Aylık veride de HAR+piyasa üç stres döneminin üçünde
+        HAR-kendi'den iyi (COVID 0.94, 2022 0.94, SVB 0.91), sakin dönemlerde ise avantajı yok. Bu, piyasa geneline yayılan
+        şoklarda diğer sektörlerin durumunun tahmin için önem kazandığını gösteren bir ipucu; ancak aylık kesitlerde
+        örnek sayısı çok az (5, 12 ve 3 ay).
+  \item \textbf{Kriz pencerelerinde OOS \Rsq{} yanıltıcı.} COVID penceresinde bütün modellerin \Rsq{} değeri 0.68--0.77.
+        Bunun nedeni modellerin başarısı değil: risk train ortalamasının çok üstüne çıktığı için, riskin yükseldiğini fark eden
+        her model yüksek \Rsq{} alıyor. Kriz pencerelerinde göreli MSE ve DM esas alınmalı.
+  \item \textbf{QLIKE'ta EWMA iyi görünüyor.} QLIKE riskin eksik tahminini daha ağır cezalandırıyor, EWMA ise yapısı gereği riski
+        biraz yüksek tahmin ediyor. Bu yüzden ana ölçüt olarak log ölçeğinde MSE ve \Rsq{} kullanıldı.
+\end{enumerate}
+
+% =====================================================================
+\section{Sınırlar}
+\begin{itemize}
+  \item Aylık test 116 aydan oluşuyor; yıl bazında ve kriz kesitlerinde örnek sayısı çok az. 10 ayrı yıllık testte
+        1--2 tanesinin şans eseri anlamlı çıkması beklenir; ana sonuç birleşik değerlendirmedir.
+  \item LSTM'ler için hiperparametre araması yapılmadı; her görünümde tek bir ayar denendi.
+  \item Günlük LSTM sonuçları henüz yok; günlükte yalnızca kıyas modelleri raporlandı.
+  \item Yalnızca değer ağırlıklı portföyler ve tek bir risk vekili (log ortalama kare getiri) kullanıldı.
+  \item Aylık toplama ay içindeki zamanlamayı yok ediyor: şok ve tepki çoğu zaman aynı aya düşüyor.
+\end{itemize}
+
+% =====================================================================
+\section{Sonraki adımlar}
+\begin{enumerate}
+  \item Günlük kriz pencerelerinde LSTM koşusu (\texttt{configs/lstm\_daily\_crisis.yaml}, GPU gerekiyor).
+  \item LSTM-çapraz için düzenlileştirme denemesi: daha küçük model, daha yüksek dropout ve ağırlık azaltma ile val üzerinde
+        küçük bir ızgara araması. Amaç, kaybın yalnızca kötü ayardan kaynaklanıp kaynaklanmadığını görmek.
+  \item Şok senaryosu analizi: bir sektörün girdisine $-k\sigma$ şok verip diğer sektörlerin tahminindeki değişimden
+        49$\times$49 yayılım matrisi çıkarmak; sakin ve gergin piyasa rejimlerinde karşılaştırmak.
+  \item Aşama 2--4: GARCH ve VAR tabanlı yayılım endeksleri, ardından sektörler arası etkileşimi bir graf üzerinden modelleyen
+        GNN / Temporal GNN. Aylık bulgu da buna işaret ediyor: ağırlık paylaşan model çalışıyor, yapısız yoğun model çöküyor.
+\end{enumerate}
+
+% =====================================================================
+\section*{Tekrarlanabilirlik}
+\small\sloppy
+Kod: \url{https://github.com/salihcengiz/sector-spillover} (commit \texttt{89c0e91} ve sonrası). Deney ayarları
+\texttt{configs/} altında: \texttt{lstm\_monthly\_b.yaml}, \texttt{lstm\_monthly\_a.yaml}, \texttt{lstm\_daily\_crisis.yaml},
+\texttt{lstm\_daily\_b.yaml}. LSTM koşuları Google Colab'da (CPU) yapıldı; çıktılar Drive'da \texttt{20261122-064031\_lstm\_monthly\_b}
+ve \texttt{20261122-071641\_lstm\_monthly\_a} klasörlerinde. Günlük kıyas modeli sonuçları aynı kodla (LSTM'siz, birkaç saniyelik
+hesap) üretildi. Bütün akış 47 birim testiyle sınanıyor: özelliklerin geleceği görmemesi, purge ve embargo, ölçekleyicinin yalnızca
+train'e bakması ve sektör modelinde sektörler arası etkinin sıfır olması.
+
+\end{document}
