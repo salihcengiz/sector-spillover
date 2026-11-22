@@ -10,6 +10,9 @@ Config (YAML ya da sözlük) bölümleri:
                walk-forward   : {embargo, walk_forward: {first_test_year, last_test_year, val_years}}
   prep:      lookback, clip
   baselines: names, params
+  graph_models: graf tabanlı doğrusal modeller (torch gerekmez):
+             {graphs: {ad: {type: glasso | corr | none}}, models: [{name, type: ghar, features: view | har, graph: ad}]}
+             Graflar her katmanda yalnızca o katmanın train dönemiyle kurulur.
   models:    [{name, type, params}, ...]   (boş bırakılırsa yalnızca kıyas modelleri çalışır; torch gerekmez)
   training:  TrainConfig alanları
   seeds:     [0, 1, ...]   her model her seed ile ayrı eğitilir; tahminlerin ortalaması model olarak raporlanır
@@ -20,7 +23,7 @@ Config (YAML ya da sözlük) bölümleri:
 
 Çıktılar: <output_dir>/<zaman>_<name>/ altında
   <katman>/  summary.csv, per_sector.csv, dm.csv, seeds.csv, history.csv, predictions.npz, scaler.npz,
-             checkpoints/<model>_s<seed>.pt
+             graphs.csv + graphs.npz (graf modelleri varsa), checkpoints/<model>_s<seed>.pt
   pooled/    birden çok katman varsa: bütün katmanların test tahminleri tek seri olarak
              (summary.csv, per_sector.csv, dm.csv, predictions.npz)
   slices.csv, slices_dm.csv   evaluation.slices verildiyse
@@ -39,10 +42,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from .baselines import fit_predict
+from .baselines import GHAR, fit_predict
 from .data import build_view, load_returns
 from .data.panel import Panel
 from .evaluation import ALL_SECTORS, evaluate, train_mean
+from .graphs import build_graph
 from .prep import SplitSpec, prepare, walk_forward_specs
 
 POOLED = "pooled"
@@ -134,6 +138,29 @@ def _train_models(cfg: dict, data, fold_dir: Path, log: Callable[[str], None]):
     return ensemble, per_seed, history, info
 
 
+def _graph_models(cfg: dict, panel: Panel, splits, returns: Optional[pd.DataFrame], fold_dir: Path,
+                  log: Callable[[str], None]) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
+    """Config'teki grafları kurar (yalnızca train dönemiyle) ve graf modellerini eğitir."""
+    gcfg = cfg.get("graph_models") or {}
+    graphs, rows = {}, []
+    for gname, gspec in gcfg.get("graphs", {}).items():
+        g = build_graph(gspec, panel, splits, returns)
+        graphs[gname] = g
+        rows.append({"graph": gname, **{k: v for k, v in g.items() if k not in ("A", "W")}})
+        log(f"  graf {gname}: {g['type']}, yoğunluk {g['density']:.3f}")
+    preds = {}
+    for spec in gcfg.get("models", []):
+        if spec.get("type", "ghar") != "ghar":
+            raise ValueError(f"Bilinmeyen graf modeli tipi: {spec.get('type')!r}.")
+        if spec["graph"] not in graphs:
+            raise ValueError(f"{spec['name']}: tanımsız graf {spec['graph']!r}.")
+        model = GHAR(features=spec.get("features", "view")).fit(panel, splits, graphs[spec["graph"]]["W"])
+        preds[spec["name"]] = model.predict(panel)
+    if graphs:
+        np.savez(fold_dir / "graphs.npz", **{f"A__{k}": g["A"] for k, g in graphs.items()})
+    return preds, pd.DataFrame(rows)
+
+
 def _evaluate_all(preds: Dict[str, np.ndarray], panel: Panel, idx: np.ndarray, bench: np.ndarray,
                   eval_cfg: dict) -> Dict[str, pd.DataFrame]:
     """Referansa karşı tablolar + config'teki ek DM çiftleri."""
@@ -153,13 +180,13 @@ def _save_predictions(path: Path, panel: Panel, idx: np.ndarray, preds: Dict[str
 
 def _save_tables(tables: Dict[str, pd.DataFrame], out_dir: Path) -> None:
     tables["summary"].to_csv(out_dir / "summary.csv")
-    for key in ("per_sector", "dm", "seeds", "history"):
+    for key in ("per_sector", "dm", "seeds", "history", "graphs"):
         if key in tables:
             tables[key].to_csv(out_dir / f"{key}.csv", index=False)
 
 
 def run_fold(cfg: dict, panel: Panel, fold_name: str, spec: SplitSpec, fold_dir: Path,
-             log: Callable[[str], None] = print) -> FoldResult:
+             log: Callable[[str], None] = print, returns: Optional[pd.DataFrame] = None) -> FoldResult:
     fold_dir.mkdir(parents=True, exist_ok=True)
     prep_cfg = cfg.get("prep", {})
     data = prepare(panel, spec, lookback=int(prep_cfg.get("lookback", 60)), clip=prep_cfg.get("clip", 10.0))
@@ -168,6 +195,8 @@ def run_fold(cfg: dict, panel: Panel, fold_name: str, spec: SplitSpec, fold_dir:
 
     base_cfg = cfg.get("baselines", {})
     preds = fit_predict(panel, splits, base_cfg.get("names"), base_cfg.get("params"))
+    graph_preds, graph_table = _graph_models(cfg, panel, splits, returns, fold_dir, log)
+    preds.update(graph_preds)
     per_seed, history, info = {}, [], []
     if cfg.get("models"):
         lstm_preds, per_seed, history, info = _train_models(cfg, data, fold_dir, log)
@@ -181,6 +210,8 @@ def run_fold(cfg: dict, panel: Panel, fold_name: str, spec: SplitSpec, fold_dir:
         seeds = pd.concat([seeds.reset_index(drop=True), seed_summary], axis=1)
     tables["seeds"] = seeds
     tables["history"] = pd.DataFrame(history)
+    if len(graph_table):
+        tables["graphs"] = graph_table
 
     _save_tables(tables, fold_dir)
     _save_predictions(fold_dir / "predictions.npz", panel, splits.test, {**preds, **per_seed})
@@ -254,7 +285,7 @@ def run_experiment(cfg: dict, root: Path = Path("."), quick: bool = False, retur
     for fold_name, spec in split_folds(cfg["split"]):
         if folds and fold_name not in folds:
             continue
-        results[fold_name] = run_fold(cfg, panel, fold_name, spec, run_dir / fold_name, log)
+        results[fold_name] = run_fold(cfg, panel, fold_name, spec, run_dir / fold_name, log, returns=returns)
     if not results:
         raise ValueError(f"Çalıştırılacak katman yok (seçilen: {folds}).")
 

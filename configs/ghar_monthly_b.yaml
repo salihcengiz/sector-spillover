@@ -1,0 +1,49 @@
+# Aylık görünüm, B düzeni: GHAR (Zhang vd., 2025) ve kıyas modelleri. Eğitim OLS ile saniyeler sürer.
+# Bölme ve test ayları lstm_monthly_b ile aynı (train ≤ 2010, val 2011–2016, test 2017-01 → 2026-09).
+name: ghar_monthly_b
+output_dir: outputs/runs
+
+data:
+  returns_csv: data/processed/49_sektor_gunluk_getiri_temiz.csv
+  start: "1985-01-01"
+  end: "2026-09-30"
+  frequency: monthly
+  view:
+    features: [mean, max, min]        # isteğe bağlı 4. özellik: std
+
+split:
+  train_end: "2010-12-31"
+  val_end: "2016-12-31"
+  embargo: 1                          # ay
+
+prep:
+  lookback: 12                        # ay
+  clip: 10.0
+
+baselines:
+  names: [persistence, ewma, har_own, har_market, ridge_all]
+
+graph_models:
+  # Graflar her katmanda yalnızca train dönemi verisiyle kurulur.
+  graphs:
+    glasso: {type: glasso}            # Zhang vd. (2025): train dönemindeki günlük getirilerde GraphicalLassoCV
+    corr: {type: corr}                # Son vd. (2023): train aylarındaki log RV'lerin korelasyonu
+    none: {type: none}                # boş graf: grafın katkısını ölçmek için kontrol
+  models:
+    # view: hocanın özellikleri (ayın ortalaması, en yüksek ve en düşük günü); har: aylık HAR (1, 3, 12 ay)
+    - {name: ghar_view_glasso, type: ghar, features: view, graph: glasso}
+    - {name: ghar_view_corr,   type: ghar, features: view, graph: corr}
+    - {name: ghar_view_none,   type: ghar, features: view, graph: none}
+    - {name: ghar_har_glasso,  type: ghar, features: har,  graph: glasso}
+    - {name: ghar_har_corr,    type: ghar, features: har,  graph: corr}
+    - {name: ghar_har_none,    type: ghar, features: har,  graph: none}
+
+models: []                            # LSTM yok (sonuçları lstm_monthly_* koşularında, aynı test aylarında)
+
+evaluation:
+  reference: har_own
+  pairs:                              # grafın katkısı: aynı özelliklerle graflı model, grafsız modele karşı
+    - [ghar_view_glasso, ghar_view_none]
+    - [ghar_view_corr, ghar_view_none]
+    - [ghar_har_glasso, ghar_har_none]
+    - [ghar_har_corr, ghar_har_none]

@@ -45,6 +45,8 @@ python scripts/run_experiment.py --config configs/lstm_monthly_b.yaml
 | `configs/lstm_monthly_b.yaml` | aylık | B: train ≤ 2010, val 2011–2016, test 2017 → 2026-09; embargo 1 ay |
 | `configs/lstm_daily_crisis.yaml` | günlük | COVID, SVB ve son 1 yıl için ayrı katmanlar; her katmanda yalnızca öncesindeki veriyle eğitim; embargo 22 gün |
 | `configs/lstm_daily_b.yaml` | günlük | B (ön analizle karşılaştırma için) |
+| `configs/lstm_monthly_a.yaml` | aylık | A: walk-forward, test 2017 → 2026-09, her yıl yeniden eğitim |
+| `configs/ghar_monthly_b.yaml` / `ghar_monthly_a.yaml` | aylık | GHAR graf modeli (Zhang vd., 2025): GLASSO / korelasyon / boş graf × hocanın özellikleri / HAR; B ve A |
 
 Seçenekler: `--quick` (tek seed, 2 epoch), `--folds covid svb` (yalnızca seçilen katmanlar), `--baselines-only` (yalnızca kıyas modelleri; torch gerekmez). Çıktılar `outputs/runs/<zaman>_<ad>/` altına yazılır.
 

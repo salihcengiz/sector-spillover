@@ -21,3 +21,6 @@ outputs/
 *.out
 *.toc
 *.synctex.gz
+
+# Makaleler (telifli PDF; public depoya girmez)
+articles/

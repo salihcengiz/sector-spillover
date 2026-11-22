@@ -13,6 +13,7 @@ import numpy as np
 from ..data.panel import Panel
 from ..prep.splits import Splits
 from .base import HAR_WINDOWS, Baseline, har_regressors
+from .graph_linear import GHAR, GHAR_FEATURES
 from .linear import HARMarket, HAROwn, RidgeAll
 from .simple import EWMA, EWMA_LAMBDA, Persistence
 
@@ -36,5 +37,5 @@ def fit_predict(panel: Panel, splits: Splits, names: Optional[Sequence[str]] = N
     return out
 
 
-__all__ = ["BASELINES", "EWMA", "EWMA_LAMBDA", "HAR_WINDOWS", "Baseline", "HARMarket", "HAROwn",
+__all__ = ["BASELINES", "EWMA", "EWMA_LAMBDA", "GHAR", "GHAR_FEATURES", "HAR_WINDOWS", "Baseline", "HARMarket", "HAROwn",
            "Persistence", "RidgeAll", "build_baseline", "fit_predict", "har_regressors"]
